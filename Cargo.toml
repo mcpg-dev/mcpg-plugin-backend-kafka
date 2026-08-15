@@ -1,0 +1,128 @@
+[package]
+name = "mcpg-plugin-backend-kafka"
+version = "0.1.0-alpha.16"
+license = "BUSL-1.1"
+edition = "2024"
+description = """
+Kafka backend plugin for mcpg. Provides tool dispatch over Kafka
+request/reply (BackendPlugin for `kind: "kafka"`) and resource-change
+subscription over a Kafka topic (WatchStrategyPlugin for
+`kind: "kafka_topic"`). The main mcpg binary depends on this crate
+at runtime via the plugin registry and carries no direct rdkafka
+dependency.
+"""
+
+[lib]
+# cdylib: the .so the gateway's native_loader dlopens via libloading.
+# rlib: keeps in-tree unit tests + the gateway's current static path
+# (KafkaBackendPlugin::new in app/mod.rs) building until the dynamic
+# loader path lands.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Default OFF so the workspace build (which links the gateway bin
+# against the kafka rlib) does not emit `mcpg_plugin_register` and
+# collide with the other plugin rlibs. Standalone cdylib builds (nx
+# docker:build / OCI publish) opt in via `--features cdylib-export`.
+default = []
+cdylib-export = []
+# Declared empty so the SDK macro's `register_static` accessor
+# (`#[cfg(feature = "static-firstparty")]`) does not trip
+# `unexpected_cfgs` here. kafka is consumed as a cdylib, not via the
+# SDK static-firstparty fast path (the gateway uses its own manual
+# FirstPartyRegistrar block today).
+static-firstparty = []
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# cdylib sync bridge: declare_plugin! macro, SyncBackendPlugin /
+# SyncWatchStrategyPlugin FFI traits, HostHandle + HostHandleBackendHost.
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+bytes = "1"
+futures = "0.3"
+# NOTE: there is deliberately NO `sasl2-sys` / cyrus-sasl dependency.
+# librdkafka's SASL SCRAM-SHA-256/512, PLAIN, and OAUTHBEARER mechanisms
+# are built on the SSL/crypto lib (the `ssl`/`ssl-vendored` rdkafka
+# feature below) and need NO cyrus-sasl. Only GSSAPI/Kerberos requires
+# cyrus (the rdkafka `sasl` feature → sasl2-sys), and this plugin never
+# wired GSSAPI — its config only sets `sasl.mechanism`/`sasl.username`/
+# `sasl.password` string props (see src/lib.rs build_kafka_bundle), with
+# SCRAM/PLAIN the documented mechanisms. Dropping the cyrus dep + the
+# rdkafka `sasl` feature is what keeps musl/static and windows
+# cross-builds working: sasl2-sys runs an autotools `./configure` that
+# falls back to the host CC under cross-compilation, leaking host glibc
+# into the artifact. SUPPORTED SASL: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512,
+# OAUTHBEARER (covers Confluent Cloud + AWS MSK). UNSUPPORTED: GSSAPI/
+# Kerberos.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `rt-multi-thread` powers the cdylib sync bridge's private runtime
+# (`Builder::new_multi_thread`); `rt`/`time`/`sync` cover the async
+# produce/consume + idle-sweeper logic shared with the static path.
+tokio = { version = "1", features = [
+  "sync",
+  "rt",
+  "rt-multi-thread",
+  "time",
+  "macros",
+] }
+tokio-util = "0.7"
+tracing = "0.1"
+# metrics-rs facade — counters + histogram emitted from
+# the plugin's main entry point so operators get the triad floor
+# (logs, metrics, traces) without enabling additional collection.
+metrics = "0.24"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The SSL flavor is TARGET-CONDITIONAL — each arch gets the variant its
+# build lane can actually produce:
+#
+# x86_64-linux → dynamic "ssl" (system libssl3, which the gateway
+# runtime image already ships for other transitive deps). NOT
+# "ssl-vendored": with RUSTC_WRAPPER=sccache, cc-rs propagates the
+# wrapper to C compiles (CC="sccache cc"), and sccache's
+# preprocessor-based caching mangles OpenSSL's perlasm x86_64 .s files
+# (`#` is the asm comment char; cpp eats those lines) — the assembler
+# then dies at a random file/line ("character following name is not
+# '#'"; 3/3 failures across CD runs 27389987043 + 27391509153).
+#
+# everything else (aarch64-linux cross, darwin) → "ssl-vendored": the
+# cross sysroot carries no aarch64 libssl-dev (openssl-sys's probe
+# can't even compile, run 27392581616), and vendored is immune to the
+# sccache bug off x86_64 anyway — aarch64/darwin perlasm emits `//`
+# comments, which the preprocessor passes through untouched (why those
+# lanes never failed).
+# x86_64-linux-GNU keeps DYNAMIC "ssl" (system libssl3) — vendored OpenSSL
+# on x86_64 re-triggers the sccache×perlasm bug (sccache's preprocessor
+# mangles OpenSSL's `#`-comment x86_64 .s files; the asm comment char
+# clashes). The `target_env = "gnu"` qualifier is what routes x86_64-MUSL
+# into the vendored branch below (musl has no system libssl). No "sasl"
+# feature anywhere → no cyrus/sasl2-sys (see the dependencies note above).
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))'.dependencies]
+rdkafka = { version = "0.37", features = [
+  "cmake-build",
+  "ssl",
+  "libz-static",
+  # librdkafka unconditionally `#include <curl/curl.h>` in its OAUTHBEARER-OIDC
+  # path, regardless of rdkafka-sys's `-DWITH_CURL=0` hint. Vendor libcurl
+  # so the cmake build finds the header.
+  "curl-static",
+] }
+
+# Everything else — x86_64-MUSL, aarch64 (gnu + musl), darwin — uses
+# vendored OpenSSL (no system libssl in a cross sysroot / static image;
+# and off x86_64 the perlasm emits `//` comments, immune to the sccache
+# bug). Still no "sasl"/cyrus.
+[target.'cfg(not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")))'.dependencies]
+rdkafka = { version = "0.37", features = [
+  "cmake-build",
+  "ssl-vendored",
+  "libz-static",
+  "curl-static",
+] }

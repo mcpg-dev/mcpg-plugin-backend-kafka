@@ -1,0 +1,12 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.backend.kafka
+name: Kafka Binding
+license: BUSL-1.1
+description: |
+  Dispatches tool calls as Kafka produce + consume round-trips
+  using correlation-id headers. Ships alongside plugin.watch.yaml
+  in the same crate for Kafka-topic-based resource watches.
+class: backend
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities: [network_outbound]
