@@ -222,7 +222,7 @@ unavailable.
 
 Releases publish a platform-agnostic OCI artifact, so a `plugins:` entry
 can set `source.oci` to
-`ghcr.io/mcpg-dev/source-code/plugins/backend-kafka:protocol-1` instead
+`ghcr.io/mcpg-dev/plugins/backend-kafka` instead
 of `source.path` and let the gateway resolve the right os/arch/libc
 build for its host.
 
