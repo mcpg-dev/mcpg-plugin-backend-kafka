@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-backend-kafka"
-version = "0.1.0-alpha.32"
+version = "0.1.0-alpha.38"
 license = "BUSL-1.1"
 edition = "2024"
 description = """
@@ -34,10 +34,10 @@ cdylib-export = []
 static-firstparty = []
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.29", version = "=0.1.0-beta.29" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.35", version = "=0.1.0-beta.35" }
 # cdylib sync bridge: declare_plugin! macro, SyncBackendPlugin /
 # SyncWatchStrategyPlugin FFI traits, HostHandle + HostHandleBackendHost.
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.30", version = "=0.1.0-beta.30" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.36", version = "=0.1.0-beta.36" }
 anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"
@@ -105,7 +105,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # into the vendored branch below (musl has no system libssl). No "sasl"
 # feature anywhere → no cyrus/sasl2-sys (see the dependencies note above).
 [target.'cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))'.dependencies]
-rdkafka = { version = "0.37", features = [
+rdkafka = { version = "0.39", features = [
   "cmake-build",
   "ssl",
   "libz-static",
@@ -120,7 +120,7 @@ rdkafka = { version = "0.37", features = [
 # and off x86_64 the perlasm emits `//` comments, immune to the sccache
 # bug). Still no "sasl"/cyrus.
 [target.'cfg(not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")))'.dependencies]
-rdkafka = { version = "0.37", features = [
+rdkafka = { version = "0.39", features = [
   "cmake-build",
   "ssl-vendored",
   "libz-static",
