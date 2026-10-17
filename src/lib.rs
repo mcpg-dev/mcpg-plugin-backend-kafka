@@ -31,7 +31,7 @@ use mcpg_plugin_protocol::{
     BackendError, BackendPlugin, BackendRequest, BackendResponse, PluginManifest, WatchError,
     WatchEvent, WatchEventSink, WatchHandle, WatchStrategyPlugin, firstparty_manifest,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -943,12 +943,148 @@ async fn resolve_bundle_for_call(
 #[serde(deny_unknown_fields)]
 struct KafkaWatchSpec {
     topic: String,
-    #[serde(default = "default_watch_group_id")]
-    group_id: String,
+    /// Consumer group. A resource watch defaults to the shared
+    /// `mcpg-resource-watcher`; an event source to its own
+    /// `mcpg-events-{name}`.
+    #[serde(default)]
+    group_id: Option<String>,
 }
 
-fn default_watch_group_id() -> String {
-    "mcpg-resource-watcher".to_owned()
+impl KafkaWatchSpec {
+    /// The spec a watch was given, and the positions where an event source
+    /// stopped when the host handed them back.
+    fn parse(spec: &serde_json::Value) -> Result<(Self, Option<KafkaPositions>), WatchError> {
+        let (spec, resume) = mcpg_plugin_protocol::take_watch_resume(spec);
+        let parsed: Self = serde_json::from_value(spec).map_err(|e| WatchError::InvalidSpec {
+            message: format!("Kafka watch spec: {e}"),
+        })?;
+        let resume = resume
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| WatchError::InvalidSpec {
+                message: format!("Kafka resume position: {e}"),
+            })?;
+        Ok((parsed, resume))
+    }
+
+    fn group_id(&self, resource_uri: &str) -> String {
+        if let Some(group) = &self.group_id {
+            return group.clone();
+        }
+        match resource_uri.strip_prefix(mcpg_plugin_protocol::EVENT_SOURCE_URI_PREFIX) {
+            Some(name) => format!("mcpg-events-{name}"),
+            None => "mcpg-resource-watcher".to_owned(),
+        }
+    }
+}
+
+/// The event type of one record on the watched topic.
+pub const KAFKA_MESSAGE_EVENT_TYPE: &str = "kafka.message";
+
+/// Broker round trips while an event source assigns its partitions.
+const KAFKA_ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The next offset to read in each partition: an event source's
+/// `upstream_cursor`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct KafkaPositions {
+    next: BTreeMap<i32, i64>,
+}
+
+/// Assign every partition of `topic` at its position in `resume`, at the
+/// start of a partition `resume` does not name, or at the end of each one
+/// when there is no `resume`. Blocking: it asks the broker for the
+/// partitions and their watermarks.
+fn assign_partitions(
+    consumer: &rdkafka::consumer::StreamConsumer,
+    topic: &str,
+    resume: Option<&KafkaPositions>,
+) -> Result<KafkaPositions, WatchError> {
+    use rdkafka::consumer::Consumer;
+    use rdkafka::{Offset, TopicPartitionList};
+    let failed = |what: &str, e: rdkafka::error::KafkaError| WatchError::Subscribe {
+        message: format!("{what} of '{topic}': {e}"),
+    };
+    let metadata = consumer
+        .fetch_metadata(Some(topic), KAFKA_ASSIGN_TIMEOUT)
+        .map_err(|e| failed("metadata", e))?;
+    let partitions: Vec<i32> = metadata
+        .topics()
+        .iter()
+        .filter(|t| t.name() == topic && t.error().is_none())
+        .flat_map(|t| t.partitions().iter().map(|p| p.id()))
+        .collect();
+    if partitions.is_empty() {
+        return Err(WatchError::Subscribe {
+            message: format!("topic '{topic}' has no partitions"),
+        });
+    }
+    let mut start = KafkaPositions::default();
+    let mut list = TopicPartitionList::new();
+    for partition in partitions {
+        let next = match resume.map(|r| r.next.get(&partition)) {
+            Some(Some(next)) => *next,
+            Some(None) | None => {
+                let (low, high) = consumer
+                    .fetch_watermarks(topic, partition, KAFKA_ASSIGN_TIMEOUT)
+                    .map_err(|e| failed("watermarks", e))?;
+                if resume.is_some() { low } else { high }
+            }
+        };
+        start.next.insert(partition, next);
+        list.add_partition_offset(topic, partition, Offset::Offset(next))
+            .map_err(|e| failed("assignment", e))?;
+    }
+    consumer
+        .assign(&list)
+        .map_err(|e| failed("assignment", e))?;
+    Ok(start)
+}
+
+/// The `kafka.message` event of one record, carrying the positions after it.
+fn record_event<M: rdkafka::Message>(message: &M, positions: &mut KafkaPositions) -> WatchEvent {
+    use rdkafka::message::Headers;
+    let topic = message.topic();
+    let (partition, offset) = (message.partition(), message.offset());
+    positions.next.insert(partition, offset + 1);
+    let headers: serde_json::Map<String, serde_json::Value> = message
+        .headers()
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|h| {
+                    let value = h.value.map_or(serde_json::Value::Null, |v| {
+                        serde_json::Value::String(String::from_utf8_lossy(v).into_owned())
+                    });
+                    (h.key.to_owned(), value)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // A tombstone record has no value, and so no encoding.
+    let (value, value_encoding) = match message.payload().map(mcpg_plugin_protocol::event_body) {
+        Some((value, encoding)) => (value, serde_json::Value::from(encoding)),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+    WatchEvent {
+        event_id: Some(format!("{topic}:{partition}:{offset}")),
+        event_type: Some(KAFKA_MESSAGE_EVENT_TYPE.to_owned()),
+        occurred_at: message
+            .timestamp()
+            .to_millis()
+            .and_then(mcpg_plugin_protocol::occurred_at_from_millis),
+        data: Some(serde_json::json!({
+            "topic": topic,
+            "partition": partition,
+            "offset": offset,
+            "key": message.key().map(|k| String::from_utf8_lossy(k).into_owned()),
+            "value": value,
+            "valueEncoding": value_encoding,
+            "headers": headers,
+        })),
+        upstream_cursor: serde_json::to_value(&*positions).ok(),
+        ..WatchEvent::default()
+    }
 }
 
 /// `WatchStrategyPlugin` implementation for `kind: "kafka_topic"`.
@@ -1019,42 +1155,60 @@ impl WatchStrategyPlugin for KafkaWatchPlugin {
         use rdkafka::config::ClientConfig;
         use rdkafka::consumer::{Consumer, StreamConsumer};
 
-        let parsed: KafkaWatchSpec =
-            serde_json::from_value(spec.clone()).map_err(|e| WatchError::InvalidSpec {
-                message: format!("Kafka watch spec: {e}"),
-            })?;
+        let (parsed, resume) = KafkaWatchSpec::parse(spec)?;
         if parsed.topic.trim().is_empty() {
             return Err(WatchError::InvalidSpec {
                 message: "topic must not be empty".into(),
             });
         }
 
-        // A watch only needs change-notification, not historical
-        // replay: `auto.offset.reset = latest` skips the existing
-        // backlog and fires on new records only, and auto-commit keeps
-        // the consumer-group offset advancing without per-message
-        // bookkeeping (at-most-once is acceptable — a dropped
-        // notification just delays the next resolve, never corrupts).
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("group.id", &parsed.group_id)
-            .set("bootstrap.servers", &self.bootstrap_servers)
-            .set("enable.auto.commit", "true")
-            .set("auto.offset.reset", "latest")
-            .create()
-            .map_err(|e| WatchError::Subscribe {
-                message: format!("failed to create Kafka consumer: {e}"),
-            })?;
+        let group_id = parsed.group_id(resource_uri);
+        let event_source = mcpg_plugin_protocol::is_event_source(resource_uri);
+        let mut client = ClientConfig::new();
+        client
+            .set("group.id", &group_id)
+            .set("bootstrap.servers", &self.bootstrap_servers);
+        if event_source {
+            // The host stores the positions; one older than the retained
+            // log reads from the oldest record still there.
+            client
+                .set("enable.auto.commit", "false")
+                .set("auto.offset.reset", "earliest");
+        } else {
+            // A resource watch only needs change-notification: new records
+            // only, and a dropped one just delays the next resolve.
+            client
+                .set("enable.auto.commit", "true")
+                .set("auto.offset.reset", "latest");
+        }
+        let consumer: StreamConsumer = client.create().map_err(|e| WatchError::Subscribe {
+            message: format!("failed to create Kafka consumer: {e}"),
+        })?;
 
-        consumer
-            .subscribe(&[&parsed.topic])
+        let (consumer, mut positions) = if event_source {
+            let topic = parsed.topic.clone();
+            let (consumer, start) = tokio::task::spawn_blocking(move || {
+                assign_partitions(&consumer, &topic, resume.as_ref()).map(|start| (consumer, start))
+            })
+            .await
             .map_err(|e| WatchError::Subscribe {
-                message: format!("subscribe to '{}': {e}", parsed.topic),
-            })?;
+                message: format!("partition assignment: {e}"),
+            })??;
+            (consumer, Some(start))
+        } else {
+            consumer
+                .subscribe(&[&parsed.topic])
+                .map_err(|e| WatchError::Subscribe {
+                    message: format!("subscribe to '{}': {e}", parsed.topic),
+                })?;
+            (consumer, None)
+        };
 
         info!(
             uri = %resource_uri,
             topic = %parsed.topic,
-            group_id = %parsed.group_id,
+            group_id = %group_id,
+            event_source,
             "Kafka watch: consumer started"
         );
 
@@ -1073,8 +1227,12 @@ impl WatchStrategyPlugin for KafkaWatchPlugin {
                     }
                     msg = stream.next() => {
                         match msg {
-                            Some(Ok(_)) => {
-                                sink.emit(WatchEvent::default()).await;
+                            Some(Ok(message)) => {
+                                let event = match positions.as_mut() {
+                                    Some(positions) => record_event(&message, positions),
+                                    None => WatchEvent::default(),
+                                };
+                                sink.emit(event).await;
                             }
                             Some(Err(e)) => {
                                 // Transient consumer errors (rebalance,
@@ -1414,7 +1572,81 @@ mod tests {
         let v = serde_json::json!({ "topic": "changes" });
         let spec: KafkaWatchSpec = serde_json::from_value(v).unwrap();
         assert_eq!(spec.topic, "changes");
-        assert_eq!(spec.group_id, "mcpg-resource-watcher");
+        assert_eq!(spec.group_id("resource://x"), "mcpg-resource-watcher");
+    }
+
+    #[test]
+    fn an_event_source_reads_with_its_own_group() {
+        let spec: KafkaWatchSpec =
+            serde_json::from_value(serde_json::json!({ "topic": "orders" })).unwrap();
+        assert_eq!(
+            spec.group_id("mcpg-event://orders.created"),
+            "mcpg-events-orders.created"
+        );
+        let pinned: KafkaWatchSpec =
+            serde_json::from_value(serde_json::json!({ "topic": "orders", "group_id": "mine" }))
+                .unwrap();
+        assert_eq!(pinned.group_id("mcpg-event://orders.created"), "mine");
+    }
+
+    #[test]
+    fn the_resume_position_round_trips_through_the_spec() {
+        let mut positions = KafkaPositions::default();
+        positions.next.insert(0, 43);
+        positions.next.insert(2, 7);
+        let cursor = serde_json::to_value(&positions).unwrap();
+        assert_eq!(cursor, serde_json::json!({ "next": { "0": 43, "2": 7 } }));
+        let (spec, resume) = KafkaWatchSpec::parse(&serde_json::json!({
+            "topic": "orders",
+            mcpg_plugin_protocol::WATCH_RESUME_SPEC_KEY: cursor,
+        }))
+        .unwrap();
+        assert_eq!(spec.topic, "orders");
+        assert_eq!(resume, Some(positions));
+    }
+
+    #[test]
+    fn a_record_becomes_a_kafka_message_event_with_the_positions_after_it() {
+        use rdkafka::message::{Header, OwnedHeaders, OwnedMessage, Timestamp};
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "trace",
+            value: Some("abc"),
+        });
+        let message = OwnedMessage::new(
+            Some(br#"{"id":"o-1"}"#.to_vec()),
+            Some(b"k-1".to_vec()),
+            "orders".to_owned(),
+            Timestamp::CreateTime(1_712_345_678_123),
+            1,
+            41,
+            Some(headers),
+        );
+        let mut positions = KafkaPositions::default();
+        positions.next.insert(0, 10);
+        let event = record_event(&message, &mut positions);
+        assert_eq!(event.event_id.as_deref(), Some("orders:1:41"));
+        assert_eq!(event.event_type.as_deref(), Some(KAFKA_MESSAGE_EVENT_TYPE));
+        assert_eq!(
+            event.occurred_at.as_deref(),
+            Some("2024-04-05T19:34:38.123Z")
+        );
+        assert_eq!(
+            event.data,
+            Some(serde_json::json!({
+                "topic": "orders",
+                "partition": 1,
+                "offset": 41,
+                "key": "k-1",
+                "value": { "id": "o-1" },
+                "valueEncoding": "json",
+                "headers": { "trace": "abc" },
+            }))
+        );
+        assert_eq!(
+            event.upstream_cursor,
+            Some(serde_json::json!({ "next": { "0": 10, "1": 42 } })),
+            "every partition's position, so a resume misses none"
+        );
     }
 
     #[tokio::test]

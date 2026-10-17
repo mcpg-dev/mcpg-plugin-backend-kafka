@@ -10,3 +10,27 @@ class: backend
 runtime: native-cdylib-v1
 protocol_version: "1.0"
 required_capabilities: [network_outbound]
+# MCP Events: how the kafka_topic watch runs as a source, and what it emits.
+watch_strategies:
+  - kind: kafka_topic
+    placement: single_owner
+    resume: true
+    event_types:
+      - name: kafka.message
+        description: One record on the watched topic. The eventId is topic:partition:offset.
+        payload_schema:
+          type: object
+          required: [topic, partition, offset]
+          properties:
+            topic: { type: string }
+            partition: { type: integer }
+            offset: { type: integer }
+            key: { type: [string, "null"] }
+            value:
+              description: The record value, read as valueEncoding says; null for a tombstone.
+            valueEncoding:
+              description: How value holds the record value - its JSON, its UTF-8 text, or standard base64 of its bytes; null for a tombstone.
+              enum: [json, text, base64, null]
+            headers:
+              type: object
+              additionalProperties: { type: [string, "null"] }
