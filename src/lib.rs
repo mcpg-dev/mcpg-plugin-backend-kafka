@@ -726,6 +726,11 @@ impl KafkaBackendPlugin {
                     }
                     return Ok(BackendResponse { payload, truncated });
                 }
+                // librdkafka reconnects after a non-fatal error, such as one
+                // unreachable broker address; only the deadline ends the wait.
+                Ok(Err(rdkafka::error::KafkaError::MessageConsumption(code))) => {
+                    warn!(backend = %backend_name, error = %code, "Kafka consume error; waiting on");
+                }
                 Ok(Err(e)) => {
                     return Err(BackendError::Transport {
                         message: format!("Kafka consume: {e}"),
@@ -1882,6 +1887,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -1908,6 +1914,7 @@ mod tests {
                 key: "idem-test-key".to_owned(),
                 scope_hash: "deadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
             }),
+            client: None,
         };
         let pairs = super::build_outbound_headers("corr-1", &req);
         let names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
@@ -1949,6 +1956,7 @@ mod tests {
             session_id: None,
             identity: None,
             idempotency: None,
+            client: None,
         };
         let pairs = super::build_outbound_headers("corr-1", &req);
         let names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
@@ -2318,6 +2326,7 @@ mod tests {
             session_id: None,
             identity: Some(verified_identity("mallory")),
             idempotency: None,
+            client: None,
         };
 
         let bundle = super::resolve_bundle_for_call(&profile, &request, "sec")
@@ -2433,6 +2442,7 @@ mod tests {
             session_id: None,
             identity: Some(verified_identity("alice")),
             idempotency: None,
+            client: None,
         };
         let bundle = super::resolve_bundle_for_call(&profile, &request, "g")
             .await
