@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-backend-kafka"
-version = "0.1.0"
+version = "0.1.1"
 license = "BUSL-1.1"
 edition = "2024"
 description = """
@@ -34,10 +34,10 @@ cdylib-export = []
 static-firstparty = []
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-rc.3", version = "=0.1.0-rc.3" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-rc.4", version = "=0.1.0-rc.4" }
 # cdylib sync bridge: declare_plugin! macro, SyncBackendPlugin /
 # SyncWatchStrategyPlugin FFI traits, HostHandle + HostHandleBackendHost.
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.5", version = "=0.1.0-rc.5" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.9", version = "=0.1.0-rc.9" }
 anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"
